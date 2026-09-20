@@ -72,7 +72,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     // Find user in Users Master (Single login point)
     const result = await db.query(
-      `SELECT u.id, u.email, u.password_hash, u.role, u.name, u.receiver_id, u.active, r.code as receiver_code, r.name as receiver_name
+      `SELECT u.id, u.email, u.password_hash, u.role, u.name, u.receiver_id, u.active, r.code as receiver_code, r.name as receiver_name, r.active as receiver_active
        FROM users u
        LEFT JOIN receivers r ON u.receiver_id = r.id
        WHERE LOWER(u.email) = LOWER($1)`,
@@ -85,7 +85,7 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 
     const user = result.rows[0];
 
-    if (user.active === false) {
+    if (user.active === false || user.receiver_active === false) {
       return res.status(403).json({ message: 'This account has been deactivated' });
     }
 
@@ -292,7 +292,185 @@ app.get('/api/receivers', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
-// 5. ADMIN USER MANAGEMENT (NX employees & supplier/receiver accounts)
+// 5. ADMIN SUPPLIER / RECEIVER MASTER
+// ==========================================
+// Each row is a receiver company (code, name, address) paired 1:1 with its
+// own RECEIVER-role login account (email/password), since dispatches route
+// by receiver_id but a receiver logs in as a user.
+app.get('/api/admin/receivers', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT r.id, r.code, r.name, r.address, r.active, r.created_at,
+              u.id as user_id, u.email as login_email
+       FROM receivers r
+       LEFT JOIN users u ON u.receiver_id = r.id AND u.role = 'RECEIVER'
+       ORDER BY r.created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Fetch supplier accounts error:', error);
+    res.status(500).json({ message: 'Failed to fetch supplier accounts' });
+  }
+});
+
+app.post('/api/admin/receivers', authenticateToken, requireAdmin, async (req, res) => {
+  const { code, name, address, email, password } = req.body;
+
+  if (!code || !name || !email || !password) {
+    return res.status(400).json({ message: 'code, name, email and password are required' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ message: 'password must be at least 8 characters' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    const receiverResult = await client.query(
+      `INSERT INTO receivers (code, name, address, active)
+       VALUES ($1, $2, $3, TRUE)
+       RETURNING id, code, name, address, active, created_at`,
+      [code, name, address || null]
+    );
+    const receiver = receiverResult.rows[0];
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const userResult = await client.query(
+      `INSERT INTO users (name, email, password_hash, role, receiver_id, active)
+       VALUES ($1, $2, $3, 'RECEIVER', $4, TRUE)
+       RETURNING id, email`,
+      [name, email, passwordHash, receiver.id]
+    );
+
+    await client.query('COMMIT');
+
+    res.status(201).json({ ...receiver, user_id: userResult.rows[0].id, login_email: userResult.rows[0].email });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'A supplier with this code or login email already exists' });
+    }
+    console.error('Create supplier account error:', error);
+    res.status(500).json({ message: 'Failed to create supplier account' });
+  } finally {
+    client.release();
+  }
+});
+
+app.put('/api/admin/receivers/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { code, name, address, email } = req.body;
+
+  if (!code || !name || !email) {
+    return res.status(400).json({ message: 'code, name and email are required' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    const receiverResult = await client.query(
+      `UPDATE receivers SET code = $1, name = $2, address = $3
+       WHERE id = $4
+       RETURNING id, code, name, address, active, created_at`,
+      [code, name, address || null, id]
+    );
+    if (receiverResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Supplier not found' });
+    }
+
+    const userResult = await client.query(
+      `UPDATE users SET name = $1, email = $2
+       WHERE receiver_id = $3 AND role = 'RECEIVER'
+       RETURNING id, email`,
+      [name, email, id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({
+      ...receiverResult.rows[0],
+      user_id: userResult.rows[0]?.id || null,
+      login_email: userResult.rows[0]?.email || null
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'A supplier with this code or login email already exists' });
+    }
+    console.error('Update supplier account error:', error);
+    res.status(500).json({ message: 'Failed to update supplier account' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/admin/receivers/:id/reset-password', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ message: 'newPassword must be at least 8 characters' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    const result = await db.query(
+      `UPDATE users SET password_hash = $1 WHERE receiver_id = $2 AND role = 'RECEIVER' RETURNING id`,
+      [passwordHash, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Supplier login account not found' });
+    }
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset supplier password error:', error);
+    res.status(500).json({ message: 'Failed to reset password' });
+  }
+});
+
+app.patch('/api/admin/receivers/:id/status', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { active } = req.body;
+
+  if (typeof active !== 'boolean') {
+    return res.status(400).json({ message: 'active must be a boolean' });
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    const receiverResult = await client.query(
+      `UPDATE receivers SET active = $1 WHERE id = $2 RETURNING id, active`,
+      [active, id]
+    );
+    if (receiverResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Supplier not found' });
+    }
+
+    // Deactivating/reactivating the company cascades to its login account.
+    await client.query(
+      `UPDATE users SET active = $1 WHERE receiver_id = $2 AND role = 'RECEIVER'`,
+      [active, id]
+    );
+
+    await client.query('COMMIT');
+    res.json(receiverResult.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Toggle supplier status error:', error);
+    res.status(500).json({ message: 'Failed to update supplier status' });
+  } finally {
+    client.release();
+  }
+});
+
+// ==========================================
+// 6. ADMIN USER MANAGEMENT (NX employees)
 // ==========================================
 app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
   try {
