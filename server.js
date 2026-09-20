@@ -328,10 +328,10 @@ app.post('/api/admin/receivers', authenticateToken, requireAdmin, async (req, re
     await client.query('BEGIN');
 
     const receiverResult = await client.query(
-      `INSERT INTO receivers (code, name, address, active)
-       VALUES ($1, $2, $3, TRUE)
+      `INSERT INTO receivers (code, name, address, email, active)
+       VALUES ($1, $2, $3, $4, TRUE)
        RETURNING id, code, name, address, active, created_at`,
-      [code, name, address || null]
+      [code, name, address || null, email]
     );
     const receiver = receiverResult.rows[0];
 
@@ -371,10 +371,10 @@ app.put('/api/admin/receivers/:id', authenticateToken, requireAdmin, async (req,
     await client.query('BEGIN');
 
     const receiverResult = await client.query(
-      `UPDATE receivers SET code = $1, name = $2, address = $3
-       WHERE id = $4
+      `UPDATE receivers SET code = $1, name = $2, address = $3, email = $4
+       WHERE id = $5
        RETURNING id, code, name, address, active, created_at`,
-      [code, name, address || null, id]
+      [code, name, address || null, email, id]
     );
     if (receiverResult.rows.length === 0) {
       await client.query('ROLLBACK');
