@@ -11,11 +11,17 @@ CREATE TABLE IF NOT EXISTS receivers (
   code       VARCHAR(50)  NOT NULL UNIQUE,
   name       VARCHAR(255) NOT NULL,
   address    TEXT,
+  email      VARCHAR(255) NOT NULL,
   active     BOOLEAN      NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
 ALTER TABLE receivers ADD COLUMN IF NOT EXISTS address TEXT;
+-- Not marked NOT NULL here: adding a NOT NULL column with no default would
+-- fail on a table that already has rows. The application always supplies
+-- it going forward; the CREATE TABLE above already enforces NOT NULL for
+-- any brand-new database.
+ALTER TABLE receivers ADD COLUMN IF NOT EXISTS email VARCHAR(255);
 ALTER TABLE receivers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE receivers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
