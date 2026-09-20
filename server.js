@@ -277,6 +277,164 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
 });
 
 // ==========================================
+// 3b. DISPATCH DETAIL, RECEIPT CONFIRMATION & DISPUTE RESOLUTION
+// ==========================================
+app.get('/api/dispatches/:id', authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { role, receiverId } = req.user;
+
+  try {
+    const dispatchResult = await db.query(
+      `SELECT d.*, r.code as receiver_code, r.name as receiver_name
+       FROM dispatches d
+       JOIN receivers r ON d.receiver_id = r.id
+       WHERE d.id = $1`,
+      [id]
+    );
+    if (dispatchResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Dispatch not found' });
+    }
+    const dispatch = dispatchResult.rows[0];
+
+    if (role === 'RECEIVER' && dispatch.receiver_id !== receiverId) {
+      return res.status(403).json({ message: 'Not authorized to view this dispatch' });
+    }
+
+    const linesResult = await db.query(
+      `SELECT id, package_code, dispatched_qty, received_qty, confirm_status, remark
+       FROM dispatch_lines WHERE dispatch_id = $1 ORDER BY id ASC`,
+      [id]
+    );
+
+    res.json({ ...dispatch, lines: linesResult.rows });
+  } catch (error) {
+    console.error('Fetch dispatch detail error:', error);
+    res.status(500).json({ message: 'Failed to fetch dispatch' });
+  }
+});
+
+// RECEIVER confirms what actually arrived. Any line whose received quantity
+// doesn't match what was dispatched is auto-marked Disputed (and requires a
+// remark), which flips the whole dispatch to 'disputed' instead of 'confirmed'.
+app.post('/api/dispatches/:id/receive', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'RECEIVER') {
+    return res.status(403).json({ message: 'Only the receiver can confirm a receipt' });
+  }
+
+  const { id } = req.params;
+  const { receiving_date_time, lines } = req.body;
+
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ message: 'lines is required' });
+  }
+  for (const line of lines) {
+    if (line.id === undefined || line.received_qty === undefined) {
+      return res.status(400).json({ message: 'Each line requires id and received_qty' });
+    }
+  }
+
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+
+    const dispatchResult = await client.query(
+      `SELECT id, receiver_id, status FROM dispatches WHERE id = $1 FOR UPDATE`,
+      [id]
+    );
+    if (dispatchResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Dispatch not found' });
+    }
+    const dispatch = dispatchResult.rows[0];
+
+    if (dispatch.receiver_id !== req.user.receiverId) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Not authorized to confirm this dispatch' });
+    }
+    if (dispatch.status !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'This dispatch has already been confirmed' });
+    }
+
+    let anyDisputed = false;
+    for (const line of lines) {
+      const lineResult = await client.query(
+        `SELECT dispatched_qty FROM dispatch_lines WHERE id = $1 AND dispatch_id = $2`,
+        [line.id, id]
+      );
+      if (lineResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: `Line ${line.id} does not belong to this dispatch` });
+      }
+
+      const dispatchedQty = lineResult.rows[0].dispatched_qty;
+      const receivedQty = Number(line.received_qty) || 0;
+      const confirmStatus = receivedQty === dispatchedQty ? 'Accepted' : 'Disputed';
+
+      if (confirmStatus === 'Disputed' && !line.remark) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'A remark is required for every disputed line' });
+      }
+      if (confirmStatus === 'Disputed') anyDisputed = true;
+
+      await client.query(
+        `UPDATE dispatch_lines SET received_qty = $1, confirm_status = $2, remark = $3 WHERE id = $4`,
+        [receivedQty, confirmStatus, line.remark || null, line.id]
+      );
+    }
+
+    const newStatus = anyDisputed ? 'disputed' : 'confirmed';
+    const updateResult = await client.query(
+      `UPDATE dispatches
+       SET status = $1, receiving_date_time = $2, receipt_submitted_at = now()
+       WHERE id = $3
+       RETURNING *`,
+      [newStatus, receiving_date_time || new Date(), id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ message: 'Receipt submitted', dispatch: updateResult.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Submit receipt error:', error);
+    res.status(500).json({ message: 'Failed to submit receipt' });
+  } finally {
+    client.release();
+  }
+});
+
+// NX (or ADMIN) closes out a disputed dispatch with a resolution note, moving
+// it into the receiver's history.
+app.post('/api/dispatches/:id/resolve', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'NX' && req.user.role !== 'ADMIN') {
+    return res.status(403).json({ message: 'Only NX employees can resolve disputes' });
+  }
+
+  const { id } = req.params;
+  const { resolution_note } = req.body;
+
+  if (!resolution_note || !resolution_note.trim()) {
+    return res.status(400).json({ message: 'resolution_note is required' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE dispatches SET status = 'resolved', resolution_note = $1
+       WHERE id = $2 AND status = 'disputed'
+       RETURNING *`,
+      [resolution_note, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Disputed dispatch not found' });
+    }
+    res.json({ message: 'Dispute resolved', dispatch: result.rows[0] });
+  } catch (error) {
+    console.error('Resolve dispute error:', error);
+    res.status(500).json({ message: 'Failed to resolve dispute' });
+  }
+});
+
+// ==========================================
 // 4. RECEIVERS DIRECTORY (for dispatch creation dropdown)
 // ==========================================
 app.get('/api/receivers', authenticateToken, async (req, res) => {

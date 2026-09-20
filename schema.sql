@@ -71,8 +71,15 @@ CREATE TABLE IF NOT EXISTS dispatch_lines (
   id             SERIAL PRIMARY KEY,
   dispatch_id    INTEGER      NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
   package_code   VARCHAR(100) NOT NULL,
-  dispatched_qty INTEGER      NOT NULL DEFAULT 0
+  dispatched_qty INTEGER      NOT NULL DEFAULT 0,
+  received_qty   INTEGER,
+  confirm_status VARCHAR(20),
+  remark         TEXT
 );
+
+ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS received_qty INTEGER;
+ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS confirm_status VARCHAR(20);
+ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS remark TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_lines_dispatch_id ON dispatch_lines (dispatch_id);
 
