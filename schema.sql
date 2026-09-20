@@ -1,5 +1,9 @@
 -- NRGP database schema (PostgreSQL / Neon)
--- Run this once against a fresh database before starting the API:
+-- Safe to run repeatedly, including against a database where these tables
+-- already exist from an earlier version of the app: every statement uses
+-- IF NOT EXISTS, and ALTER TABLE ... ADD COLUMN IF NOT EXISTS backfills any
+-- columns a pre-existing table is missing (CREATE TABLE IF NOT EXISTS alone
+-- does NOT add columns to a table that already exists).
 --   psql "$DATABASE_URL" -f schema.sql
 
 CREATE TABLE IF NOT EXISTS receivers (
@@ -9,6 +13,9 @@ CREATE TABLE IF NOT EXISTS receivers (
   active     BOOLEAN      NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+ALTER TABLE receivers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE receivers ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS users (
   id            SERIAL PRIMARY KEY,
@@ -21,6 +28,11 @@ CREATE TABLE IF NOT EXISTS users (
   active        BOOLEAN      NOT NULL DEFAULT TRUE,
   created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS receiver_id INTEGER REFERENCES receivers(id);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_users_email ON users (LOWER(email));
 
@@ -40,6 +52,9 @@ CREATE TABLE IF NOT EXISTS dispatches (
   created_by             INTEGER      REFERENCES users(id),
   created_at             TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+
+ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS created_by INTEGER REFERENCES users(id);
+ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_dispatches_receiver_id ON dispatches (receiver_id);
 CREATE INDEX IF NOT EXISTS idx_dispatches_status ON dispatches (status);
