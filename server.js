@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const db = require('./db');
@@ -7,11 +9,32 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'nrgp_super_secret_key_2026';
+
+// Fail fast rather than silently signing tokens with a known, hardcoded secret.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set.');
+  process.exit(1);
+}
+
+const ROLES = ['ADMIN', 'NX', 'RECEIVER', 'SUPPLIER'];
 
 // Middleware
-app.use(cors());
+app.use(helmet());
+app.use(cors({
+  // Restrict via CORS_ORIGIN (comma-separated) in production; defaults to
+  // allowing any origin only when the env var isn't configured.
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map(o => o.trim()) : true
+}));
 app.use(express.json());
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many login attempts. Please try again later.' }
+});
 
 // Authentication Middleware
 const authenticateToken = (req, res, next) => {
@@ -29,10 +52,17 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'ADMIN') {
+    return res.status(403).json({ message: 'Admin access required' });
+  }
+  next();
+};
+
 // ==========================================
 // 1. AUTHENTICATION (SHARED LOGIN PAGE)
 // ==========================================
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
@@ -42,9 +72,9 @@ app.post('/api/auth/login', async (req, res) => {
   try {
     // Find user in Users Master (Single login point)
     const result = await db.query(
-      `SELECT u.id, u.email, u.password_hash, u.role, u.name, u.receiver_id, r.code as receiver_code, r.name as receiver_name 
-       FROM users u 
-       LEFT JOIN receivers r ON u.receiver_id = r.id 
+      `SELECT u.id, u.email, u.password_hash, u.role, u.name, u.receiver_id, u.active, r.code as receiver_code, r.name as receiver_name
+       FROM users u
+       LEFT JOIN receivers r ON u.receiver_id = r.id
        WHERE LOWER(u.email) = LOWER($1)`,
       [email]
     );
@@ -55,13 +85,24 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user = result.rows[0];
 
-    // For initial seed testing or hashed passwords check
+    if (user.active === false) {
+      return res.status(403).json({ message: 'This account has been deactivated' });
+    }
+
+    const isBcryptHash = user.password_hash.startsWith('$2b$') || user.password_hash.startsWith('$2a$');
     let validPassword = false;
-    if (user.password_hash.startsWith('$2b$') || user.password_hash.startsWith('$2a$')) {
+
+    if (isBcryptHash) {
       validPassword = await bcrypt.compare(password, user.password_hash);
     } else {
-      // Fallback for dev/testing plain text initial setup
-      validPassword = (password === user.password_hash || password === 'admin123');
+      // Legacy plain-text password from initial seeding. Only ever matches
+      // this specific account's own stored value (no universal bypass).
+      validPassword = password === user.password_hash;
+      if (validPassword) {
+        // Migrate to a proper hash now that we've verified the password.
+        const newHash = await bcrypt.hash(password, 10);
+        await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [newHash, user.id]);
+      }
     }
 
     if (!validPassword) {
@@ -106,28 +147,28 @@ app.post('/api/auth/login', async (req, res) => {
 // ==========================================
 app.get('/api/dispatches', authenticateToken, async (req, res) => {
   const { role, receiverId } = req.user;
-  const { status, tab } = req.query;
+  const { status } = req.query;
 
   try {
     let query = `
-      SELECT 
-        d.id, 
-        d.transaction_id, 
-        d.dispatch_date_time, 
-        d.dispatch_submitted_at, 
-        d.receiving_date_time, 
-        d.receipt_submitted_at, 
-        d.vehicle_no, 
-        d.driver_details, 
-        d.warehouse_pic, 
-        d.status, 
-        d.resolution_note, 
-        r.code as receiver_code, 
+      SELECT
+        d.id,
+        d.transaction_id,
+        d.dispatch_date_time,
+        d.dispatch_submitted_at,
+        d.receiving_date_time,
+        d.receipt_submitted_at,
+        d.vehicle_no,
+        d.driver_details,
+        d.warehouse_pic,
+        d.status,
+        d.resolution_note,
+        r.code as receiver_code,
         r.name as receiver_name
       FROM dispatches d
       JOIN receivers r ON d.receiver_id = r.id
     `;
-    
+
     let params = [];
     let conditions = [];
 
@@ -168,19 +209,41 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
 
   const { receiver_id, dispatch_date_time, vehicle_no, driver_details, lines } = req.body;
 
+  if (!receiver_id) {
+    return res.status(400).json({ message: 'receiver_id is required' });
+  }
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return res.status(400).json({ message: 'At least one packaging line is required' });
+  }
+  for (const line of lines) {
+    if (!line.package_code) {
+      return res.status(400).json({ message: 'Each line requires a package_code' });
+    }
+  }
+
+  const client = await db.getClient();
   try {
-    // Generate auto Transaction ID (NRGP-YYYY-####)
+    await client.query('BEGIN');
+
     const year = new Date().getFullYear();
-    const countResult = await db.query(`SELECT COUNT(*) FROM dispatches WHERE transaction_id LIKE 'NRGP-${year}-%'`);
-    const nextNum = String(parseInt(countResult.rows[0].count) + 1).padStart(4, '0');
+
+    // Atomically claim the next sequence number for this year, avoiding the
+    // race condition of a plain COUNT(*)-based approach under concurrency.
+    const counterResult = await client.query(
+      `INSERT INTO dispatch_counters (year, last_num)
+       VALUES ($1, 1)
+       ON CONFLICT (year) DO UPDATE SET last_num = dispatch_counters.last_num + 1
+       RETURNING last_num`,
+      [year]
+    );
+    const nextNum = String(counterResult.rows[0].last_num).padStart(4, '0');
     const transactionId = `NRGP-${year}-${nextNum}`;
 
     // Auto-fill Warehouse PIC from logged-in NX user's name
     const warehousePic = req.user.name || 'NX Dispatch Staff';
 
-    // Insert main Dispatch record
-    const dispatchResult = await db.query(
-      `INSERT INTO dispatches 
+    const dispatchResult = await client.query(
+      `INSERT INTO dispatches
        (transaction_id, receiver_id, dispatch_date_time, vehicle_no, driver_details, warehouse_pic, status, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
        RETURNING *`,
@@ -189,16 +252,15 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
 
     const newDispatch = dispatchResult.rows[0];
 
-    // Insert Packaging Lines
-    if (lines && lines.length > 0) {
-      for (const line of lines) {
-        await db.query(
-          `INSERT INTO dispatch_lines (dispatch_id, package_code, dispatched_qty)
-           VALUES ($1, $2, $3)`,
-          [newDispatch.id, line.package_code, line.dispatched_qty || 0]
-        );
-      }
+    for (const line of lines) {
+      await client.query(
+        `INSERT INTO dispatch_lines (dispatch_id, package_code, dispatched_qty)
+         VALUES ($1, $2, $3)`,
+        [newDispatch.id, line.package_code, line.dispatched_qty || 0]
+      );
     }
+
+    await client.query('COMMIT');
 
     res.status(201).json({
       message: 'Dispatch created successfully',
@@ -206,8 +268,150 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
+    await client.query('ROLLBACK');
     console.error('Create dispatch error:', error);
     res.status(500).json({ message: 'Failed to create dispatch' });
+  } finally {
+    client.release();
+  }
+});
+
+// ==========================================
+// 4. RECEIVERS DIRECTORY (for dispatch creation dropdown)
+// ==========================================
+app.get('/api/receivers', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, code, name FROM receivers WHERE active = TRUE ORDER BY name ASC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Fetch receivers error:', error);
+    res.status(500).json({ message: 'Failed to fetch receivers' });
+  }
+});
+
+// ==========================================
+// 5. ADMIN USER MANAGEMENT (NX employees & supplier/receiver accounts)
+// ==========================================
+app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT id, name, email, role, phone, receiver_id, active, created_at FROM users ORDER BY created_at DESC`
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Fetch users error:', error);
+    res.status(500).json({ message: 'Failed to fetch users' });
+  }
+});
+
+app.post('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  const { name, email, role, phone, password } = req.body;
+
+  if (!name || !email || !role || !password) {
+    return res.status(400).json({ message: 'name, email, role and password are required' });
+  }
+  if (!ROLES.includes(role)) {
+    return res.status(400).json({ message: `role must be one of: ${ROLES.join(', ')}` });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ message: 'password must be at least 8 characters' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(password, 10);
+    const result = await db.query(
+      `INSERT INTO users (name, email, password_hash, role, phone, active)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id, name, email, role, phone, active, created_at`,
+      [name, email, passwordHash, role, phone || null]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'A user with this email already exists' });
+    }
+    console.error('Create user error:', error);
+    res.status(500).json({ message: 'Failed to create user' });
+  }
+});
+
+app.put('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, email, role, phone } = req.body;
+
+  if (!name || !email || !role) {
+    return res.status(400).json({ message: 'name, email and role are required' });
+  }
+  if (!ROLES.includes(role)) {
+    return res.status(400).json({ message: `role must be one of: ${ROLES.join(', ')}` });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE users SET name = $1, email = $2, role = $3, phone = $4
+       WHERE id = $5
+       RETURNING id, name, email, role, phone, active, created_at`,
+      [name, email, role, phone || null, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ message: 'A user with this email already exists' });
+    }
+    console.error('Update user error:', error);
+    res.status(500).json({ message: 'Failed to update user' });
+  }
+});
+
+app.post('/api/admin/users/:id/reset-password', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+
+  if (!newPassword || newPassword.length < 8) {
+    return res.status(400).json({ message: 'newPassword must be at least 8 characters' });
+  }
+
+  try {
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    const result = await db.query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id`,
+      [passwordHash, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({ message: 'Failed to reset password' });
+  }
+});
+
+app.patch('/api/admin/users/:id/status', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { active } = req.body;
+
+  if (typeof active !== 'boolean') {
+    return res.status(400).json({ message: 'active must be a boolean' });
+  }
+
+  try {
+    const result = await db.query(
+      `UPDATE users SET active = $1 WHERE id = $2 RETURNING id, active`,
+      [active, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Toggle user status error:', error);
+    res.status(500).json({ message: 'Failed to update user status' });
   }
 });
 
