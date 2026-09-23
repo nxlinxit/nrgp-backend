@@ -212,13 +212,21 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
   if (!receiver_id) {
     return res.status(400).json({ message: 'receiver_id is required' });
   }
+  if (!vehicle_no || !String(vehicle_no).trim()) {
+    return res.status(400).json({ message: 'vehicle_no is required' });
+  }
   if (!Array.isArray(lines) || lines.length === 0) {
     return res.status(400).json({ message: 'At least one packaging line is required' });
   }
+  let totalQty = 0;
   for (const line of lines) {
     if (!line.package_code) {
       return res.status(400).json({ message: 'Each line requires a package_code' });
     }
+    totalQty += Number(line.dispatched_qty) || 0;
+  }
+  if (totalQty <= 0) {
+    return res.status(400).json({ message: 'Total dispatched quantity must be greater than zero' });
   }
 
   const client = await db.getClient();
