@@ -18,6 +18,8 @@ if (!JWT_SECRET) {
 }
 
 const ROLES = ['ADMIN', 'NX', 'RECEIVER', 'SUPPLIER'];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DEFAULT_BULK_PASSWORD = 'Password@123';
 
 // Middleware
 app.use(helmet());
@@ -528,6 +530,92 @@ app.post('/api/admin/receivers', authenticateToken, requireAdmin, async (req, re
   }
 });
 
+// Bulk-create supplier accounts (receiver + linked login) from a CSV parsed
+// client-side. Valid rows are created; invalid or duplicate rows are
+// skipped and reported by row number so the admin can fix just those and
+// re-upload.
+app.post('/api/admin/receivers/bulk', authenticateToken, requireAdmin, async (req, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ message: 'rows is required and must be a non-empty array' });
+  }
+
+  const existingEmailsResult = await db.query(`SELECT LOWER(email) as email FROM users`);
+  const existingEmails = new Set(existingEmailsResult.rows.map((r) => r.email));
+  const existingCodesResult = await db.query(`SELECT UPPER(code) as code FROM receivers`);
+  const existingCodes = new Set(existingCodesResult.rows.map((r) => r.code));
+  const seenEmails = new Set();
+  const seenCodes = new Set();
+
+  const errors = [];
+  let created = 0;
+  const passwordHash = await bcrypt.hash(DEFAULT_BULK_PASSWORD, 10);
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNum = i + 2; // account for the CSV header row
+    const row = rows[i] || {};
+    const code = (row.code || '').trim();
+    const name = (row.name || '').trim();
+    const email = (row.email || '').trim();
+    const address = (row.address || '').trim();
+    const emailLower = email.toLowerCase();
+    const codeUpper = code.toUpperCase();
+
+    if (!code) {
+      errors.push({ row: rowNum, message: 'code is required' });
+      continue;
+    }
+    if (!name) {
+      errors.push({ row: rowNum, message: 'name is required' });
+      continue;
+    }
+    if (!email || !EMAIL_RE.test(email)) {
+      errors.push({ row: rowNum, message: 'a valid email is required' });
+      continue;
+    }
+    if (existingCodes.has(codeUpper) || seenCodes.has(codeUpper)) {
+      errors.push({ row: rowNum, message: `code already exists: ${code}` });
+      continue;
+    }
+    if (existingEmails.has(emailLower) || seenEmails.has(emailLower)) {
+      errors.push({ row: rowNum, message: `email already exists: ${email}` });
+      continue;
+    }
+
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
+      const receiverResult = await client.query(
+        `INSERT INTO receivers (code, name, address, email, active)
+         VALUES ($1, $2, $3, $4, TRUE)
+         RETURNING id`,
+        [code, name, address || null, email]
+      );
+      await client.query(
+        `INSERT INTO users (name, email, password_hash, role, receiver_id, active)
+         VALUES ($1, $2, $3, 'RECEIVER', $4, TRUE)`,
+        [name, email, passwordHash, receiverResult.rows[0].id]
+      );
+      await client.query('COMMIT');
+      seenCodes.add(codeUpper);
+      seenEmails.add(emailLower);
+      created += 1;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error.code === '23505') {
+        errors.push({ row: rowNum, message: `code or email already exists: ${code} / ${email}` });
+      } else {
+        console.error('Bulk create supplier row error:', error);
+        errors.push({ row: rowNum, message: 'Failed to create this row' });
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  res.json({ created, errors, defaultPassword: DEFAULT_BULK_PASSWORD });
+});
+
 app.put('/api/admin/receivers/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { code, name, address, email } = req.body;
@@ -683,6 +771,74 @@ app.post('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =
     console.error('Create user error:', error);
     res.status(500).json({ message: 'Failed to create user' });
   }
+});
+
+// Bulk-create NX employees from a CSV parsed client-side. Valid rows are
+// created; invalid or duplicate rows are skipped and reported by row
+// number so the admin can fix just those and re-upload.
+app.post('/api/admin/users/bulk', authenticateToken, requireAdmin, async (req, res) => {
+  const { rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ message: 'rows is required and must be a non-empty array' });
+  }
+
+  const existing = await db.query(`SELECT LOWER(email) as email FROM users`);
+  const existingEmails = new Set(existing.rows.map((r) => r.email));
+  const seenInBatch = new Set();
+
+  const errors = [];
+  let created = 0;
+  const passwordHash = await bcrypt.hash(DEFAULT_BULK_PASSWORD, 10);
+
+  for (let i = 0; i < rows.length; i++) {
+    const rowNum = i + 2; // account for the CSV header row
+    const row = rows[i] || {};
+    const name = (row.name || '').trim();
+    const email = (row.email || '').trim();
+    const role = (row.role || '').trim().toUpperCase();
+    const phone = (row.phone || '').trim();
+    const emailLower = email.toLowerCase();
+
+    if (!name) {
+      errors.push({ row: rowNum, message: 'name is required' });
+      continue;
+    }
+    if (!email || !EMAIL_RE.test(email)) {
+      errors.push({ row: rowNum, message: 'a valid email is required' });
+      continue;
+    }
+    if (!['NX', 'ADMIN'].includes(role)) {
+      errors.push({ row: rowNum, message: 'role must be NX or ADMIN' });
+      continue;
+    }
+    if (existingEmails.has(emailLower)) {
+      errors.push({ row: rowNum, message: `email already exists: ${email}` });
+      continue;
+    }
+    if (seenInBatch.has(emailLower)) {
+      errors.push({ row: rowNum, message: `duplicate email in file: ${email}` });
+      continue;
+    }
+
+    try {
+      await db.query(
+        `INSERT INTO users (name, email, password_hash, role, phone, active)
+         VALUES ($1, $2, $3, $4, $5, TRUE)`,
+        [name, email, passwordHash, role, phone || null]
+      );
+      seenInBatch.add(emailLower);
+      created += 1;
+    } catch (error) {
+      if (error.code === '23505') {
+        errors.push({ row: rowNum, message: `email already exists: ${email}` });
+      } else {
+        console.error('Bulk create user row error:', error);
+        errors.push({ row: rowNum, message: 'Failed to create this row' });
+      }
+    }
+  }
+
+  res.json({ created, errors, defaultPassword: DEFAULT_BULK_PASSWORD });
 });
 
 app.put('/api/admin/users/:id', authenticateToken, requireAdmin, async (req, res) => {
