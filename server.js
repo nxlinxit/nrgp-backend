@@ -223,7 +223,11 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
     if (!line.package_code) {
       return res.status(400).json({ message: 'Each line requires a package_code' });
     }
-    totalQty += Number(line.dispatched_qty) || 0;
+    const qty = Number(line.dispatched_qty) || 0;
+    if (line.package_code === 'OTH-001' && qty > 0 && !(line.description || '').trim()) {
+      return res.status(400).json({ message: 'A description is required for the "Others" package type' });
+    }
+    totalQty += qty;
   }
   if (totalQty <= 0) {
     return res.status(400).json({ message: 'Total dispatched quantity must be greater than zero' });
@@ -262,9 +266,9 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
 
     for (const line of lines) {
       await client.query(
-        `INSERT INTO dispatch_lines (dispatch_id, package_code, dispatched_qty)
-         VALUES ($1, $2, $3)`,
-        [newDispatch.id, line.package_code, line.dispatched_qty || 0]
+        `INSERT INTO dispatch_lines (dispatch_id, package_code, dispatched_qty, description)
+         VALUES ($1, $2, $3, $4)`,
+        [newDispatch.id, line.package_code, line.dispatched_qty || 0, line.description || null]
       );
     }
 
@@ -309,7 +313,7 @@ app.get('/api/dispatches/:id', authenticateToken, async (req, res) => {
     }
 
     const linesResult = await db.query(
-      `SELECT id, package_code, dispatched_qty, received_qty, confirm_status, remark
+      `SELECT id, package_code, dispatched_qty, received_qty, confirm_status, remark, description
        FROM dispatch_lines WHERE dispatch_id = $1 ORDER BY id ASC`,
       [id]
     );

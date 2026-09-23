@@ -74,12 +74,16 @@ CREATE TABLE IF NOT EXISTS dispatch_lines (
   dispatched_qty INTEGER      NOT NULL DEFAULT 0,
   received_qty   INTEGER,
   confirm_status VARCHAR(20),
-  remark         TEXT
+  remark         TEXT,
+  description    TEXT
 );
 
 ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS received_qty INTEGER;
 ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS confirm_status VARCHAR(20);
 ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS remark TEXT;
+-- Free-text detail for a package line (used by the "Others" package type
+-- to record what the item actually is).
+ALTER TABLE dispatch_lines ADD COLUMN IF NOT EXISTS description TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_dispatch_lines_dispatch_id ON dispatch_lines (dispatch_id);
 
