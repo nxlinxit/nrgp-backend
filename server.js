@@ -144,6 +144,45 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
   }
 });
 
+// Restores the signed-in user from a stored token (e.g. after a page refresh).
+// Re-reads the account so a deactivation since login ends the session.
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT u.id, u.email, u.role, u.name, u.receiver_id, u.active, r.code as receiver_code, r.name as receiver_name, r.active as receiver_active
+       FROM users u
+       LEFT JOIN receivers r ON u.receiver_id = r.id
+       WHERE u.id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ message: 'Account not found' });
+    }
+
+    const user = result.rows[0];
+
+    if (user.active === false || user.receiver_active === false) {
+      return res.status(403).json({ message: 'This account has been deactivated' });
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        name: user.name,
+        receiverId: user.receiver_id,
+        receiverCode: user.receiver_code,
+        receiverName: user.receiver_name
+      }
+    });
+  } catch (error) {
+    console.error('Fetch current user error:', error);
+    res.status(500).json({ message: 'Failed to load current user' });
+  }
+});
+
 // ==========================================
 // 2. FETCH DISPATCHES (BY ROLE & TAB)
 // ==========================================
