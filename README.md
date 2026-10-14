@@ -19,6 +19,9 @@ Backend API for the NRGP Non-Returnable Gate Pass web app.
    ```
    psql "$DATABASE_URL" -f schema.sql
    ```
+   Run the same command again after pulling updates. It is safe to re-run:
+   it only adds missing tables and columns, and backfills dispatch history
+   for records created before history tracking existed.
 4. Create the first admin account (never commit real credentials):
    ```
    ADMIN_EMAIL=admin@example.com ADMIN_NAME="Portal Admin" ADMIN_PASSWORD='choose-a-strong-password' npm run seed:admin

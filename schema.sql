@@ -93,3 +93,77 @@ CREATE TABLE IF NOT EXISTS dispatch_counters (
   year     INTEGER PRIMARY KEY,
   last_num INTEGER NOT NULL DEFAULT 0
 );
+
+-- ------------------------------------------------------------------
+-- Dispute workflow: Disputed -> (NX reply) -> Open ticket -> Resolved
+-- ------------------------------------------------------------------
+-- NX's latest answer to a dispute: 'accept_mismatch' ("Yes, we accept the
+-- mismatch entry") or 'dispatched_correct' ("No, we dispatched the right
+-- quantity as per the entry").
+ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS nx_decision VARCHAR(30);
+ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS resolved_by INTEGER REFERENCES users(id);
+ALTER TABLE dispatches ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+
+-- Shown once in the supplier's pop-up: NX activity newer than this.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ;
+
+-- Append-only history of everything that happened to a dispatch.
+-- actor_name is a snapshot so history survives renames.
+CREATE TABLE IF NOT EXISTS dispatch_events (
+  id          SERIAL PRIMARY KEY,
+  dispatch_id INTEGER      NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
+  user_id     INTEGER      REFERENCES users(id),
+  actor_role  VARCHAR(20)  NOT NULL,
+  actor_name  VARCHAR(255),
+  event_type  VARCHAR(30)  NOT NULL, -- created | receipt_confirmed | mismatch_reported | nx_reply | remark | resolved
+  decision    VARCHAR(30),
+  remark      TEXT,
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  -- TRUE for entries reconstructed from data saved before history existed;
+  -- their times are approximate and they never count as unread.
+  backfilled  BOOLEAN      NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_events_dispatch_id ON dispatch_events (dispatch_id);
+
+-- When each user last opened each dispatch (drives the unread badges).
+CREATE TABLE IF NOT EXISTS dispatch_reads (
+  user_id      INTEGER     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  dispatch_id  INTEGER     NOT NULL REFERENCES dispatches(id) ON DELETE CASCADE,
+  last_read_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, dispatch_id)
+);
+
+-- Backfill history for dispatches created before dispatch_events existed.
+-- Each statement only touches dispatches that lack that kind of entry, so
+-- re-running this file is safe.
+INSERT INTO dispatch_events (dispatch_id, user_id, actor_role, actor_name, event_type, created_at, backfilled)
+SELECT d.id, d.created_by, COALESCE(u.role, 'NX'), COALESCE(u.name, d.warehouse_pic), 'created', d.dispatch_submitted_at, TRUE
+FROM dispatches d
+LEFT JOIN users u ON u.id = d.created_by
+WHERE NOT EXISTS (SELECT 1 FROM dispatch_events e WHERE e.dispatch_id = d.id AND e.event_type = 'created');
+
+INSERT INTO dispatch_events (dispatch_id, actor_role, actor_name, event_type, remark, created_at, backfilled)
+SELECT d.id, 'RECEIVER', r.name,
+       CASE WHEN d.status IN ('disputed', 'open', 'resolved') THEN 'mismatch_reported' ELSE 'receipt_confirmed' END,
+       (SELECT string_agg(
+                 CASE l.package_code
+                   WHEN 'BIN-001' THEN 'Bin' WHEN 'PAL-001' THEN 'Pallet' WHEN 'STP-001' THEN 'Steel pallet'
+                   WHEN 'TRO-001' THEN 'Trolley' WHEN 'CB-001' THEN 'Carton box' WHEN 'OTH-001' THEN 'Others'
+                   ELSE l.package_code END
+                 || ': sent ' || l.dispatched_qty || ', received ' || l.received_qty
+                 || COALESCE(' - ' || l.remark, ''),
+                 '; ' ORDER BY l.id)
+          FROM dispatch_lines l
+         WHERE l.dispatch_id = d.id AND l.confirm_status = 'Disputed'),
+       d.receipt_submitted_at, TRUE
+FROM dispatches d
+JOIN receivers r ON r.id = d.receiver_id
+WHERE d.receipt_submitted_at IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM dispatch_events e WHERE e.dispatch_id = d.id AND e.event_type IN ('receipt_confirmed', 'mismatch_reported'));
+
+INSERT INTO dispatch_events (dispatch_id, actor_role, event_type, remark, created_at, backfilled)
+SELECT d.id, 'NX', 'resolved', d.resolution_note, COALESCE(d.resolved_at, d.receipt_submitted_at, d.dispatch_submitted_at), TRUE
+FROM dispatches d
+WHERE d.status = 'resolved'
+  AND NOT EXISTS (SELECT 1 FROM dispatch_events e WHERE e.dispatch_id = d.id AND e.event_type = 'resolved');
