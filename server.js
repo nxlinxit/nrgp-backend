@@ -21,6 +21,45 @@ const ROLES = ['ADMIN', 'NX', 'RECEIVER', 'SUPPLIER'];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DEFAULT_BULK_PASSWORD = 'Password@123';
 
+const PKG_LABELS = {
+  'BIN-001': 'Bin', 'PAL-001': 'Pallet', 'STP-001': 'Steel pallet',
+  'TRO-001': 'Trolley', 'CB-001': 'Carton box', 'OTH-001': 'Others'
+};
+// NX's answer to a dispute.
+const NX_DECISIONS = ['accept_mismatch', 'dispatched_correct'];
+const isNxRole = (role) => role === 'NX' || role === 'ADMIN';
+
+// Appends an entry to a dispatch's history. `queryable` is the pool or a
+// transaction client.
+const addDispatchEvent = (queryable, dispatchId, user, eventType, { decision = null, remark = null } = {}) =>
+  queryable.query(
+    `INSERT INTO dispatch_events (dispatch_id, user_id, actor_role, actor_name, event_type, decision, remark)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [dispatchId, user.id, user.role, user.name || null, eventType, decision, remark]
+  );
+
+const markDispatchRead = (queryable, userId, dispatchId) =>
+  queryable.query(
+    `INSERT INTO dispatch_reads (user_id, dispatch_id, last_read_at) VALUES ($1, $2, now())
+     ON CONFLICT (user_id, dispatch_id) DO UPDATE SET last_read_at = now()`,
+    [userId, dispatchId]
+  );
+
+// SQL condition: dispatch `d` has history from the *other* side (NX vs.
+// supplier) that user $userParam hasn't opened since it happened. A clean
+// receipt confirmation needs no NX attention, so it never counts.
+const unreadCondition = (role, userParam) => `EXISTS (
+  SELECT 1 FROM dispatch_events ev
+  WHERE ev.dispatch_id = d.id AND NOT ev.backfilled
+    AND ev.event_type <> 'receipt_confirmed'
+    AND ev.actor_role ${role === 'RECEIVER' ? "IN ('NX', 'ADMIN')" : "= 'RECEIVER'"}
+    AND ev.created_at > COALESCE(
+      (SELECT rd.last_read_at FROM dispatch_reads rd WHERE rd.user_id = ${userParam} AND rd.dispatch_id = d.id),
+      '-infinity'::timestamptz)
+)`;
+
+const EVENT_COLUMNS = 'id, dispatch_id, event_type, actor_role, actor_name, decision, remark, created_at, backfilled';
+
 // Middleware
 app.use(helmet());
 app.use(cors({
@@ -204,13 +243,19 @@ app.get('/api/dispatches', authenticateToken, async (req, res) => {
         d.warehouse_pic,
         d.status,
         d.resolution_note,
+        d.nx_decision,
+        d.resolved_at,
+        ru.name as resolved_by_name,
+        ru.role as resolved_by_role,
         r.code as receiver_code,
-        r.name as receiver_name
+        r.name as receiver_name,
+        ${unreadCondition(role, '$1')} as unread
       FROM dispatches d
       JOIN receivers r ON d.receiver_id = r.id
+      LEFT JOIN users ru ON ru.id = d.resolved_by
     `;
 
-    let params = [];
+    let params = [req.user.id];
     let conditions = [];
 
     // Filter by role scope
@@ -232,7 +277,28 @@ app.get('/api/dispatches', authenticateToken, async (req, res) => {
     query += ' ORDER BY d.dispatch_submitted_at DESC';
 
     const result = await db.query(query, params);
-    res.json(result.rows);
+    const rows = result.rows;
+
+    // ?details=1 adds package lines and full history (used by CSV export).
+    if (req.query.details && rows.length > 0) {
+      const ids = rows.map((r) => r.id);
+      const [linesResult, eventsResult] = await Promise.all([
+        db.query(
+          `SELECT id, dispatch_id, package_code, dispatched_qty, received_qty, confirm_status, remark, description
+           FROM dispatch_lines WHERE dispatch_id = ANY($1) ORDER BY id ASC`,
+          [ids]
+        ),
+        db.query(
+          `SELECT ${EVENT_COLUMNS} FROM dispatch_events WHERE dispatch_id = ANY($1) ORDER BY created_at ASC, id ASC`,
+          [ids]
+        )
+      ]);
+      const byId = new Map(rows.map((r) => [r.id, Object.assign(r, { lines: [], events: [] })]));
+      linesResult.rows.forEach((l) => byId.get(l.dispatch_id).lines.push(l));
+      eventsResult.rows.forEach((e) => byId.get(e.dispatch_id).events.push(e));
+    }
+
+    res.json(rows);
 
   } catch (error) {
     console.error('Fetch dispatches error:', error);
@@ -313,6 +379,9 @@ app.post('/api/dispatches', authenticateToken, async (req, res) => {
       );
     }
 
+    await addDispatchEvent(client, newDispatch.id, req.user, 'created');
+    await markDispatchRead(client, req.user.id, newDispatch.id);
+
     await client.query('COMMIT');
 
     res.status(201).json({
@@ -338,9 +407,11 @@ app.get('/api/dispatches/:id', authenticateToken, async (req, res) => {
 
   try {
     const dispatchResult = await db.query(
-      `SELECT d.*, r.code as receiver_code, r.name as receiver_name
+      `SELECT d.*, r.code as receiver_code, r.name as receiver_name,
+              ru.name as resolved_by_name, ru.role as resolved_by_role
        FROM dispatches d
        JOIN receivers r ON d.receiver_id = r.id
+       LEFT JOIN users ru ON ru.id = d.resolved_by
        WHERE d.id = $1`,
       [id]
     );
@@ -359,7 +430,14 @@ app.get('/api/dispatches/:id', authenticateToken, async (req, res) => {
       [id]
     );
 
-    res.json({ ...dispatch, lines: linesResult.rows });
+    const eventsResult = await db.query(
+      `SELECT ${EVENT_COLUMNS} FROM dispatch_events WHERE dispatch_id = $1 ORDER BY created_at ASC, id ASC`,
+      [id]
+    );
+
+    await markDispatchRead(db, req.user.id, dispatch.id);
+
+    res.json({ ...dispatch, lines: linesResult.rows, events: eventsResult.rows });
   } catch (error) {
     console.error('Fetch dispatch detail error:', error);
     res.status(500).json({ message: 'Failed to fetch dispatch' });
@@ -410,9 +488,10 @@ app.post('/api/dispatches/:id/receive', authenticateToken, async (req, res) => {
     }
 
     let anyDisputed = false;
+    const disputeSummary = [];
     for (const line of lines) {
       const lineResult = await client.query(
-        `SELECT dispatched_qty FROM dispatch_lines WHERE id = $1 AND dispatch_id = $2`,
+        `SELECT package_code, dispatched_qty FROM dispatch_lines WHERE id = $1 AND dispatch_id = $2`,
         [line.id, id]
       );
       if (lineResult.rows.length === 0) {
@@ -428,7 +507,11 @@ app.post('/api/dispatches/:id/receive', authenticateToken, async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(400).json({ message: 'A remark is required for every disputed line' });
       }
-      if (confirmStatus === 'Disputed') anyDisputed = true;
+      if (confirmStatus === 'Disputed') {
+        anyDisputed = true;
+        const label = PKG_LABELS[lineResult.rows[0].package_code] || lineResult.rows[0].package_code;
+        disputeSummary.push(`${label}: sent ${dispatchedQty}, received ${receivedQty} - ${line.remark}`);
+      }
 
       await client.query(
         `UPDATE dispatch_lines SET received_qty = $1, confirm_status = $2, remark = $3 WHERE id = $4`,
@@ -445,6 +528,11 @@ app.post('/api/dispatches/:id/receive', authenticateToken, async (req, res) => {
       [newStatus, receiving_date_time || new Date(), id]
     );
 
+    await addDispatchEvent(client, dispatch.id, req.user, anyDisputed ? 'mismatch_reported' : 'receipt_confirmed', {
+      remark: anyDisputed ? disputeSummary.join('; ') : null
+    });
+    await markDispatchRead(client, req.user.id, dispatch.id);
+
     await client.query('COMMIT');
     res.json({ message: 'Receipt submitted', dispatch: updateResult.rows[0] });
   } catch (error) {
@@ -456,34 +544,180 @@ app.post('/api/dispatches/:id/receive', authenticateToken, async (req, res) => {
   }
 });
 
-// NX (or ADMIN) closes out a disputed dispatch with a resolution note, moving
-// it into the receiver's history.
+// Locks a dispatch for a dispute action and checks the caller may act on it.
+// Returns { dispatch } or { error: [status, message] }.
+const lockDispatchForAction = async (client, id, user, allowedStatuses) => {
+  const result = await client.query(
+    `SELECT id, receiver_id, status, nx_decision FROM dispatches WHERE id = $1 FOR UPDATE`,
+    [id]
+  );
+  if (result.rows.length === 0) return { error: [404, 'Dispatch not found'] };
+  const dispatch = result.rows[0];
+  if (user.role === 'RECEIVER' && dispatch.receiver_id !== user.receiverId) {
+    return { error: [403, 'Not authorized to act on this dispatch'] };
+  }
+  if (!allowedStatuses.includes(dispatch.status)) {
+    return { error: [400, `This action isn't available while the dispatch is ${dispatch.status}`] };
+  }
+  return { dispatch };
+};
+
+// Runs a dispute action in a transaction with the dispatch locked.
+const runDisputeAction = async (req, res, allowedStatuses, action, failMessage) => {
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const { dispatch, error } = await lockDispatchForAction(client, req.params.id, req.user, allowedStatuses);
+    if (error) {
+      await client.query('ROLLBACK');
+      return res.status(error[0]).json({ message: error[1] });
+    }
+    const updated = await action(client, dispatch);
+    await markDispatchRead(client, req.user.id, dispatch.id);
+    await client.query('COMMIT');
+    res.json({ dispatch: updated });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`${failMessage}:`, err);
+    res.status(500).json({ message: failMessage });
+  } finally {
+    client.release();
+  }
+};
+
+const requireRemark = (req, res) => {
+  const remark = String(req.body.remark ?? req.body.resolution_note ?? '').trim();
+  if (!remark) {
+    res.status(400).json({ message: 'A remark is required' });
+    return null;
+  }
+  return remark;
+};
+
+// NX (or ADMIN) answers a dispute. This moves it to the Open ticket folder
+// (it never jumps straight to resolved) and can be repeated there to change
+// the answer; every reply is kept in the history.
+app.post('/api/dispatches/:id/reply', authenticateToken, async (req, res) => {
+  if (!isNxRole(req.user.role)) {
+    return res.status(403).json({ message: 'Only NX employees can reply to a dispute' });
+  }
+  const { decision } = req.body;
+  if (!NX_DECISIONS.includes(decision)) {
+    return res.status(400).json({ message: `decision must be one of: ${NX_DECISIONS.join(', ')}` });
+  }
+  const remark = requireRemark(req, res);
+  if (!remark) return;
+
+  await runDisputeAction(req, res, ['disputed', 'open'], async (client, dispatch) => {
+    const result = await client.query(
+      `UPDATE dispatches SET status = 'open', nx_decision = $1 WHERE id = $2 RETURNING *`,
+      [decision, dispatch.id]
+    );
+    await addDispatchEvent(client, dispatch.id, req.user, 'nx_reply', { decision, remark });
+    return result.rows[0];
+  }, 'Failed to send reply');
+});
+
+// Either side adds a remark to an open ticket.
+app.post('/api/dispatches/:id/remark', authenticateToken, async (req, res) => {
+  const remark = requireRemark(req, res);
+  if (!remark) return;
+
+  await runDisputeAction(req, res, ['open'], async (client, dispatch) => {
+    await addDispatchEvent(client, dispatch.id, req.user, 'remark', { remark });
+    return dispatch;
+  }, 'Failed to add remark');
+});
+
+// Either side closes an open ticket with a closing remark. Disputes must get
+// an NX reply first, so a disputed dispatch can't be resolved directly.
 app.post('/api/dispatches/:id/resolve', authenticateToken, async (req, res) => {
-  if (req.user.role !== 'NX' && req.user.role !== 'ADMIN') {
-    return res.status(403).json({ message: 'Only NX employees can resolve disputes' });
-  }
+  const remark = requireRemark(req, res);
+  if (!remark) return;
 
-  const { id } = req.params;
-  const { resolution_note } = req.body;
+  await runDisputeAction(req, res, ['open'], async (client, dispatch) => {
+    const result = await client.query(
+      `UPDATE dispatches
+       SET status = 'resolved', resolution_note = $1, resolved_by = $2, resolved_at = now()
+       WHERE id = $3
+       RETURNING *`,
+      [remark, req.user.id, dispatch.id]
+    );
+    await addDispatchEvent(client, dispatch.id, req.user, 'resolved', { remark });
+    return result.rows[0];
+  }, 'Failed to resolve ticket');
+});
 
-  if (!resolution_note || !resolution_note.trim()) {
-    return res.status(400).json({ message: 'resolution_note is required' });
-  }
+// ==========================================
+// 3c. NOTIFICATIONS (unread badges + supplier pop-up)
+// ==========================================
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  const { id: userId, role, receiverId } = req.user;
 
   try {
-    const result = await db.query(
-      `UPDATE dispatches SET status = 'resolved', resolution_note = $1
-       WHERE id = $2 AND status = 'disputed'
-       RETURNING *`,
-      [resolution_note, id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Disputed dispatch not found' });
+    const params = [userId];
+    let scope = '';
+    if (role === 'RECEIVER') {
+      params.push(receiverId);
+      scope = `AND d.receiver_id = $2`;
     }
-    res.json({ message: 'Dispute resolved', dispatch: result.rows[0] });
+    const countsResult = await db.query(
+      `SELECT d.status, COUNT(*)::int AS count
+       FROM dispatches d
+       WHERE ${unreadCondition(role, '$1')} ${scope}
+       GROUP BY d.status`,
+      params
+    );
+    const unread = Object.fromEntries(countsResult.rows.map((r) => [r.status, r.count]));
+
+    // Suppliers get a one-time pop-up for NX activity since they last saw it.
+    let popup = [];
+    if (role === 'RECEIVER') {
+      const popupResult = await db.query(
+        `SELECT e.id, e.dispatch_id, e.event_type, e.actor_name, e.decision, e.remark, e.created_at, d.transaction_id
+         FROM dispatch_events e
+         JOIN dispatches d ON d.id = e.dispatch_id
+         JOIN users u ON u.id = $1
+         WHERE d.receiver_id = $2
+           AND e.actor_role IN ('NX', 'ADMIN')
+           AND e.event_type IN ('nx_reply', 'remark', 'resolved')
+           AND NOT e.backfilled
+           AND e.created_at > COALESCE(u.last_notified_at, u.created_at)
+         ORDER BY e.created_at DESC
+         LIMIT 50`,
+        [userId, receiverId]
+      );
+      popup = popupResult.rows;
+    }
+
+    res.json({ unread, popup });
   } catch (error) {
-    console.error('Resolve dispute error:', error);
-    res.status(500).json({ message: 'Failed to resolve dispute' });
+    console.error('Fetch notifications error:', error);
+    res.status(500).json({ message: 'Failed to fetch notifications' });
+  }
+});
+
+// Marks the pop-up as seen up to `upToEventId` (the newest entry it showed),
+// so activity that arrives while it is open still pops up next time. Uses
+// the event's own timestamp because JS dates lose Postgres' microseconds.
+app.post('/api/notifications/dismiss', authenticateToken, async (req, res) => {
+  const upToEventId = Number(req.body.upToEventId);
+  if (!Number.isInteger(upToEventId) || upToEventId <= 0) {
+    return res.status(400).json({ message: 'upToEventId is required' });
+  }
+  try {
+    await db.query(
+      `UPDATE users
+       SET last_notified_at = GREATEST(
+         COALESCE(last_notified_at, '-infinity'::timestamptz),
+         (SELECT created_at FROM dispatch_events WHERE id = $1))
+       WHERE id = $2`,
+      [upToEventId, req.user.id]
+    );
+    res.json({ message: 'Dismissed' });
+  } catch (error) {
+    console.error('Dismiss notifications error:', error);
+    res.status(500).json({ message: 'Failed to dismiss notifications' });
   }
 });
 
