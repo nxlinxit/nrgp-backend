@@ -97,6 +97,16 @@ CREATE TABLE IF NOT EXISTS dispatch_counters (
 -- ------------------------------------------------------------------
 -- Dispute workflow: Disputed -> (NX reply) -> Open ticket -> Resolved
 -- ------------------------------------------------------------------
+-- Databases created before schema.sql existed may have dispatches.status
+-- as the enum type dispatch_status instead of VARCHAR; the workflow needs
+-- its 'open' value there too.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'dispatch_status') THEN
+    ALTER TYPE dispatch_status ADD VALUE IF NOT EXISTS 'open';
+  END IF;
+END $$;
+
 -- NX's latest answer to a dispute: 'accept_mismatch' ("Yes, we accept the
 -- mismatch entry") or 'dispatched_correct' ("No, we dispatched the right
 -- quantity as per the entry").
@@ -145,7 +155,7 @@ WHERE NOT EXISTS (SELECT 1 FROM dispatch_events e WHERE e.dispatch_id = d.id AND
 
 INSERT INTO dispatch_events (dispatch_id, actor_role, actor_name, event_type, remark, created_at, backfilled)
 SELECT d.id, 'RECEIVER', r.name,
-       CASE WHEN d.status IN ('disputed', 'open', 'resolved') THEN 'mismatch_reported' ELSE 'receipt_confirmed' END,
+       CASE WHEN d.status::text IN ('disputed', 'open', 'resolved') THEN 'mismatch_reported' ELSE 'receipt_confirmed' END,
        (SELECT string_agg(
                  CASE l.package_code
                    WHEN 'BIN-001' THEN 'Bin' WHEN 'PAL-001' THEN 'Pallet' WHEN 'STP-001' THEN 'Steel pallet'
@@ -165,5 +175,5 @@ WHERE d.receipt_submitted_at IS NOT NULL
 INSERT INTO dispatch_events (dispatch_id, actor_role, event_type, remark, created_at, backfilled)
 SELECT d.id, 'NX', 'resolved', d.resolution_note, COALESCE(d.resolved_at, d.receipt_submitted_at, d.dispatch_submitted_at), TRUE
 FROM dispatches d
-WHERE d.status = 'resolved'
+WHERE d.status::text = 'resolved'
   AND NOT EXISTS (SELECT 1 FROM dispatch_events e WHERE e.dispatch_id = d.id AND e.event_type = 'resolved');
